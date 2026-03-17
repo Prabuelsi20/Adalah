@@ -1,0 +1,215 @@
+name: Generate Keybox XML
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_id:
+        description: 'Device ID (kosongkan untuk random)'
+        required: false
+        default: ''
+      key_algorithm:
+        description: 'EC Key Curve'
+        required: false
+        default: 'prime256v1'
+        type: choice
+        options:
+          - prime256v1
+          - secp384r1
+          - secp521r1
+      rsa_bits:
+        description: 'RSA Key Size (bits)'
+        required: false
+        default: '2048'
+        type: choice
+        options:
+          - '2048'
+          - '4096'
+      cert_days:
+        description: 'Masa berlaku sertifikat (hari)'
+        required: false
+        default: '3650'
+      cert_cn:
+        description: 'Certificate Common Name'
+        required: false
+        default: 'Keybox'
+
+jobs:
+  generate-keybox:
+    name: Generate keybox.xml
+    runs-on: ubuntu-latest
+
+    steps:
+      # ─── 1. Checkout (opsional, hanya untuk menyimpan hasil ke repo) ───
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ─── 2. Pastikan OpenSSL tersedia ───
+      - name: Check OpenSSL version
+        run: |
+          openssl version
+          echo "OpenSSL ready."
+
+      # ─── 3. Setup Python ───
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ─── 4. Generate EC Private Key + Self-Signed Certificate ───
+      - name: Generate EC Private Key
+        run: |
+          CURVE="${{ github.event.inputs.key_algorithm || 'prime256v1' }}"
+          echo "Generating EC key with curve: $CURVE"
+          openssl ecparam -name "$CURVE" -genkey -noout -out ecPrivateKey.pem
+          echo "EC private key generated."
+
+      - name: Generate Self-Signed Certificate
+        run: |
+          CN="${{ github.event.inputs.cert_cn || 'Keybox' }}"
+          DAYS="${{ github.event.inputs.cert_days || '3650' }}"
+          echo "Generating certificate: CN=$CN, days=$DAYS"
+          openssl req -new -x509 \
+            -key ecPrivateKey.pem \
+            -out certificate.pem \
+            -days "$DAYS" \
+            -subj "/CN=$CN"
+          echo "Certificate generated."
+
+      # ─── 5. Generate RSA Private Key ───
+      - name: Generate RSA Private Key
+        run: |
+          BITS="${{ github.event.inputs.rsa_bits || '2048' }}"
+          echo "Generating RSA-$BITS private key..."
+          openssl genrsa -out rsaPrivateKey_raw.pem "$BITS"
+
+          # Konversi ke format PKCS1 jika hasilnya PKCS8
+          HEAD=$(head -1 rsaPrivateKey_raw.pem)
+          if echo "$HEAD" | grep -q "BEGIN PRIVATE KEY"; then
+            echo "Detected PKCS8 format, converting to PKCS1 (RSA)..."
+            openssl rsa -in rsaPrivateKey_raw.pem -out rsaPrivateKey.pem -traditional
+          else
+            echo "Already in PKCS1 format."
+            cp rsaPrivateKey_raw.pem rsaPrivateKey.pem
+          fi
+
+          rm -f rsaPrivateKey_raw.pem
+          echo "RSA private key ready."
+
+      # ─── 6. Validasi semua file PEM ───
+      - name: Validate PEM files
+        run: |
+          echo "=== Validating EC Private Key ==="
+          openssl ec -in ecPrivateKey.pem -check -noout && echo "EC key: OK"
+
+          echo "=== Validating Certificate ==="
+          openssl x509 -in certificate.pem -text -noout | grep -E "Subject:|Validity|Not Before|Not After" && echo "Certificate: OK"
+
+          echo "=== Validating RSA Private Key ==="
+          openssl rsa -in rsaPrivateKey.pem -check -noout && echo "RSA key: OK"
+
+      # ─── 7. Generate keybox.xml via Python ───
+      - name: Generate keybox.xml
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          import random
+          import string
+
+          # Device ID
+          device_id_input = "${{ github.event.inputs.device_id }}".strip()
+          if device_id_input:
+              device_id = device_id_input
+          else:
+              charset = string.ascii_letters
+              device_id = ''.join(random.choices(charset, k=random.randint(2, 12)))
+
+          print(f"Device ID: {device_id}")
+
+          # Baca file PEM
+          with open('ecPrivateKey.pem', 'r') as f:
+              ec_key = f.read().strip()
+
+          with open('certificate.pem', 'r') as f:
+              certificate = f.read().strip()
+
+          with open('rsaPrivateKey.pem', 'r') as f:
+              rsa_key = f.read().strip()
+
+          # Validasi format
+          assert ec_key.startswith('-----BEGIN EC PRIVATE KEY-----'), "EC key format invalid!"
+          assert certificate.startswith('-----BEGIN CERTIFICATE-----'), "Certificate format invalid!"
+          assert rsa_key.startswith('-----BEGIN RSA PRIVATE KEY-----'), "RSA key format invalid!"
+
+          # Template keybox.xml
+          keybox = f"""<?xml version="1.0"?>
+          <AndroidAttestation>
+            <NumberOfKeyboxes>1</NumberOfKeyboxes>
+            <Keybox DeviceID="{device_id}">
+              <Key algorithm="ecdsa">
+                <PrivateKey format="pem">
+          {ec_key}
+                </PrivateKey>
+                <CertificateChain>
+                  <NumberOfCertificates>1</NumberOfCertificates>
+                  <Certificate format="pem">
+          {certificate}
+                  </Certificate>
+                </CertificateChain>
+              </Key>
+              <Key algorithm="rsa">
+                <PrivateKey format="pem">
+          {rsa_key}
+                </PrivateKey>
+              </Key>
+            </Keybox>
+          </AndroidAttestation>
+          """
+
+          with open('keybox.xml', 'w', encoding='utf-8') as f:
+              f.write(keybox)
+
+          print(f"keybox.xml generated successfully ({len(keybox)} bytes)")
+          print(f"Device ID: {device_id}")
+          PYEOF
+
+      # ─── 8. Tampilkan ringkasan ───
+      - name: Show summary
+        run: |
+          echo "=========================================="
+          echo "  keybox.xml Generation Summary"
+          echo "=========================================="
+          echo "File size    : $(wc -c < keybox.xml) bytes"
+          echo "EC Curve     : ${{ github.event.inputs.key_algorithm || 'prime256v1' }}"
+          echo "RSA Bits     : ${{ github.event.inputs.rsa_bits || '2048' }}"
+          echo "Cert Days    : ${{ github.event.inputs.cert_days || '3650' }}"
+          echo "Cert CN      : ${{ github.event.inputs.cert_cn || 'Keybox' }}"
+          echo "------------------------------------------"
+          echo "Cert info:"
+          openssl x509 -in certificate.pem -noout -subject -dates
+          echo "=========================================="
+
+          # Tambahkan ke GitHub Step Summary
+          echo "## Keybox Generated Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| EC Curve | ${{ github.event.inputs.key_algorithm || 'prime256v1' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| RSA Bits | ${{ github.event.inputs.rsa_bits || '2048' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cert Days | ${{ github.event.inputs.cert_days || '3650' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| File Size | $(wc -c < keybox.xml) bytes |" >> $GITHUB_STEP_SUMMARY
+
+      # ─── 9. Upload keybox.xml sebagai artifact ───
+      - name: Upload keybox.xml as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: keybox-${{ github.run_number }}
+          path: keybox.xml
+          retention-days: 7
+
+      # ─── 10. Bersihkan file sensitif dari workspace ───
+      - name: Cleanup sensitive files
+        if: always()
+        run: |
+          echo "Cleaning up PEM files..."
+          rm -f ecPrivateKey.pem rsaPrivateKey.pem rsaPrivateKey_raw.pem
+          echo "Note: certificate.pem dibiarkan karena bersifat publik."
+          echo "Cleanup done."
